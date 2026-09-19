@@ -74,6 +74,15 @@ adapting this to your own, differently-imbalanced dataset, `--suggest-weights`
 prints inverse-frequency weights computed from your data instead — it's
 purely informational and never affects training on its own.
 
+### On the final model
+
+The final model is fit in two stages: a borehole-held-out split first picks
+an early-stopping epoch budget, then a fresh model is retrained from scratch
+on **all 85 non-blind boreholes** for exactly that many epochs (no further
+early stopping). This ensures the model evaluated on the blind boreholes has
+actually seen every non-blind sample's label, not just the ~90% used to pick
+the epoch count.
+
 ### On the leakage-safe graph construction
 
 Every k-NN graph used during training, early stopping, validation, and the

@@ -274,7 +274,14 @@ def train_model(model, train_graph, y_train, es_x, es_coords, train_coords, y_es
     """Train with early stopping. The ES set is attached to the training
     graph through one-directional outward edges only (never mixed into the
     training graph itself). Loss is backpropagated in shuffled mini-batches
-    of node indices over full-graph forward passes (see module docstring)."""
+    of node indices over full-graph forward passes (see module docstring).
+
+    Returns (model_with_best_weights, best_epoch), where best_epoch is the
+    1-based epoch count at which the best early-stopping loss was recorded.
+    This epoch count is used by the final-model stage to refit a fresh model
+    on every non-blind borehole (see train_fixed_epochs), so the model
+    reported as final is genuinely trained on all 85 boreholes rather than
+    just the ~90% subset used to pick the stopping point."""
     train_graph = train_graph.to(DEVICE)
     y_train_t = torch.tensor(y_train, dtype=torch.long, device=DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -289,13 +296,13 @@ def train_model(model, train_graph, y_train, es_x, es_coords, train_coords, y_es
     rng = np.random.RandomState(seed)
     best_es_loss = float("inf")
     best_state = None
+    best_epoch = 0
     wait = 0
     n = len(y_train)
 
-    for epoch in range(max_epochs):
+    for epoch in range(1, max_epochs + 1):
         model.train()
         order = rng.permutation(n)
-        out, _ = model(train_graph.x, train_graph.edge_index)
         for start in range(0, n, batch_size):
             batch_idx = order[start:start + batch_size]
             optimizer.zero_grad()
@@ -312,6 +319,7 @@ def train_model(model, train_graph, y_train, es_x, es_coords, train_coords, y_es
         if es_loss.item() < best_es_loss:
             best_es_loss = es_loss.item()
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
             wait = 0
         else:
             wait += 1
@@ -319,6 +327,33 @@ def train_model(model, train_graph, y_train, es_x, es_coords, train_coords, y_es
                 break
 
     model.load_state_dict(best_state)
+    return model, best_epoch
+
+
+def train_fixed_epochs(model, graph, y, class_weights, n_epochs,
+                        batch_size=BATCH_SIZE, seed=SEED):
+    """Train for exactly n_epochs with no early-stopping check and no
+    held-out subset -- used only to refit the final model on the complete
+    85-borehole development graph once the epoch budget has already been
+    selected via a borehole-held-out split (see train_model)."""
+    graph = graph.to(DEVICE)
+    y_t = torch.tensor(y, dtype=torch.long, device=DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    rng = np.random.RandomState(seed)
+    n = len(y)
+
+    for _epoch in range(max(int(n_epochs), 1)):
+        model.train()
+        order = rng.permutation(n)
+        for start in range(0, n, batch_size):
+            batch_idx = order[start:start + batch_size]
+            optimizer.zero_grad()
+            out, _ = model(graph.x, graph.edge_index)
+            loss = criterion(out[batch_idx], y_t[batch_idx])
+            loss.backward()
+            optimizer.step()
+    model.eval()
     return model
 
 
@@ -489,7 +524,7 @@ def run_cv_and_final(args):
         for name, ModelClass in architectures.items():
             model = ModelClass(len(feature_cols), num_classes).to(DEVICE)
             train_graph = make_training_graph(X_tr_sc[idx_main], c_tr[idx_main])
-            model = train_model(
+            model, _fold_epoch = train_model(
                 model, train_graph, y_tr[idx_main],
                 X_tr_sc[idx_es], c_tr[idx_es], c_tr[idx_main], y_tr[idx_es],
                 class_weights,
@@ -519,24 +554,37 @@ def run_cv_and_final(args):
         os.path.join(OUTPUT_DIR, "CV_Confusion_Matrix_Hybrid.xlsx")
     )
 
-    # ---- Final model on all 85 non-blind boreholes, then blind evaluation ----
-    print("\nTraining final Hybrid model on all non-blind boreholes...")
+    # ---- Final model: pick an epoch budget, then retrain on ALL 85 boreholes ----
+    # Stage A: a borehole-held-out split is used only to decide how many
+    # epochs to train for (early stopping). Stage B then discards that split
+    # and retrains a brand-new model on every non-blind sample for exactly
+    # that many epochs, so the model reported as "final" has genuinely seen
+    # all 85 development boreholes' labels, not just ~90% of them.
+    print("\nSelecting the early-stopping epoch budget for the final model...")
     scaler_final = RobustScaler()
     X_work_sc = scaler_final.fit_transform(X_work)
     X_blind_sc = scaler_final.transform(X_blind)
 
     idx_main_f, idx_es_f = make_borehole_aware_split(groups, y_work, seed=SEED)
-    final_model = HybridModel(len(feature_cols), num_classes).to(DEVICE)
-    final_train_graph = make_training_graph(X_work_sc[idx_main_f], coords_work[idx_main_f])
-    final_model = train_model(
-        final_model, final_train_graph, y_work[idx_main_f],
+    epoch_selection_model = HybridModel(len(feature_cols), num_classes).to(DEVICE)
+    epoch_selection_train_graph = make_training_graph(X_work_sc[idx_main_f], coords_work[idx_main_f])
+    _, epoch_budget = train_model(
+        epoch_selection_model, epoch_selection_train_graph, y_work[idx_main_f],
         X_work_sc[idx_es_f], coords_work[idx_es_f], coords_work[idx_main_f], y_work[idx_es_f],
         class_weights,
     )
+    print(f"Selected epoch budget: {epoch_budget} (from a borehole-held-out split of the 85 boreholes)")
+
+    print("Refitting the final model on all 85 development boreholes...")
+    final_full_graph = make_training_graph(X_work_sc, coords_work)
+    final_model = HybridModel(len(feature_cols), num_classes).to(DEVICE)
+    final_model = train_fixed_epochs(
+        final_model, final_full_graph, y_work, class_weights, epoch_budget,
+    )
 
     # Blind holdout attaches to the FIXED FINAL TRAINING GRAPH built from all
-    # non-blind boreholes (Section 4.1), i.e. all of X_work_sc -- not just the
-    # main-training split used above for backprop.
+    # non-blind boreholes (Section 4.1), i.e. all of X_work_sc -- which is
+    # now also exactly what final_model's weights were trained on.
     blind_preds, blind_probs, _ = predict_holdout(
         final_model, X_work_sc, coords_work, X_blind_sc, coords_blind
     )
